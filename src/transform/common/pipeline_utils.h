@@ -169,6 +169,59 @@ PipelineRegionsMayConflict(const BufferRegion &lhs, const BufferRegion &rhs,
   return true;
 }
 
+/*! \brief Storage size of a buffer in bits. */
+inline PrimExpr PipelineBufferStorageBits(const Buffer &buffer) {
+  PrimExpr bits =
+      make_const(DataType::Int(64), static_cast<int64_t>(buffer->dtype.bits()) *
+                                        buffer->dtype.lanes());
+  for (const PrimExpr &dim : buffer->shape) {
+    bits = bits * cast(DataType::Int(64), dim);
+  }
+  return bits;
+}
+
+/*! \brief Whether a view (T.reshape/T.view) covers a pipelined buffer.
+ *
+ * The view is versioned by its own size, which places version v where version
+ * v of the buffer is only when both are compact and have the same size in bits.
+ */
+inline bool PipelineViewCoversBuffer(const Buffer &view, const Buffer &buffer,
+                                     arith::Analyzer *analyzer) {
+  auto is_compact = [&](const Buffer &b) {
+    if (!b->axis_separators.empty() ||
+        !analyzer->CanProveEqual(b->elem_offset, 0)) {
+      return false;
+    }
+    if (b->strides.empty()) {
+      return true;
+    }
+    PrimExpr expected = make_const(b->strides.back().dtype(), 1);
+    for (int i = static_cast<int>(b->shape.size()) - 1; i >= 0; --i) {
+      if (!analyzer->CanProveEqual(b->strides[i], expected)) {
+        return false;
+      }
+      expected = expected * b->shape[i];
+    }
+    return true;
+  };
+  return is_compact(view) && is_compact(buffer) &&
+         analyzer->CanProveEqual(PipelineBufferStorageBits(view),
+                                 PipelineBufferStorageBits(buffer));
+}
+
+/*! \brief Reject a view of a pipelined buffer that cannot be versioned. */
+inline void CheckPipelineViewCoversBuffer(const Buffer &view,
+                                          const Buffer &buffer,
+                                          arith::Analyzer *analyzer) {
+  if (!PipelineViewCoversBuffer(view, buffer, analyzer)) {
+    TVM_FFI_THROW(ValueError)
+        << "Buffer '" << view->name << "' is not a compact view of the whole "
+        << "pipelined buffer '" << buffer->name
+        << "'. In a T.Pipelined loop, use T.reshape/T.view without strides "
+           "over the whole buffer, or access the buffer directly.";
+  }
+}
+
 // ---------------------------------------------------------------------------
 // GetPipelineNumStages
 // ---------------------------------------------------------------------------

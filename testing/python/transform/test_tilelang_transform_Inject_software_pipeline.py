@@ -508,6 +508,70 @@ def test_inject_software_pipeline_expands_annotated_layout():
     assert layout_map[shared.data].is_equal(layout.expand([2]))
 
 
+def _view_pipeline(first, second, view_shape):
+    n = view_shape[0]
+
+    @T.prim_func
+    def before(A: T.Tensor((16, 8, 16), T.float16), B: T.Tensor((16, 8, 16), T.float16)):
+        with T.sblock("root"):
+            shared = T.sblock_alloc_buffer((8, 16), T.float16, scope="shared.dyn")
+            view = T.decl_buffer(view_shape, T.float16, data=shared.data, scope="shared.dyn")
+            for k in T.serial(
+                8,
+                annotations={"software_pipeline_stage": [0, first - 1], "software_pipeline_order": [0, 1]},
+            ):
+                with T.sblock("load_first"):
+                    T.reads(A[k, 0:8, 0:16])
+                    T.writes(shared[0:8, 0:16])
+                    for i, j in T.grid(8, 16):
+                        shared[i, j] = A[k, i, j]
+                with T.sblock("store_first"):
+                    T.reads(shared[0:8, 0:16])
+                    T.writes(B[k, 0:8, 0:16])
+                    for i, j in T.grid(8, 16):
+                        B[k, i, j] = shared[i, j]
+            for k in T.serial(
+                8,
+                16,
+                annotations={"software_pipeline_stage": [0, second - 1], "software_pipeline_order": [0, 1]},
+            ):
+                with T.sblock("load_second"):
+                    T.reads(A[k, 0:8, 0:16])
+                    T.writes(view[0:n])
+                    for i in T.serial(n):
+                        view[i] = A[k, i // 16, i % 16]
+                with T.sblock("store_second"):
+                    T.reads(view[0:n])
+                    T.writes(B[k, 0:8, 0:16])
+                    for i in T.serial(n):
+                        B[k, i // 16, i % 16] = view[i]
+            view[0] = A[0, 0, 0]
+
+    mod = tvm.IRModule.from_expr(before.with_attr("global_symbol", "main"))
+    return tl.transform.InjectSoftwarePipeline()(mod)["main"]
+
+
+@pytest.mark.parametrize("first,second", [(2, 4), (4, 2)])
+def test_inject_software_pipeline_sibling_buffer_views(first, second):
+    """A view (T.reshape/T.view) of a pipelined buffer is versioned with it."""
+    func = _view_pipeline(first, second, (128,))
+    capacity = max(first, second)
+    accesses = [node for node_type in (tvm.tirx.BufferLoad, tvm.tirx.BufferStore) for node in collect_nodes(func, node_type)]
+    shared_data = next(node.buffer.data for node in accesses if node.buffer.scope() == "shared.dyn")
+    analyzer = tvm.arith.Analyzer()
+    for node in accesses:
+        if not node.buffer.data.same_as(shared_data):
+            continue
+        assert int(node.buffer.shape[0]) == capacity
+        bound = analyzer.const_int_bound(analyzer.simplify(node.indices[0]))
+        assert 0 <= bound.min_value <= bound.max_value < capacity
+
+
+def test_inject_software_pipeline_rejects_partial_view():
+    with pytest.raises(Exception, match="not a compact view of the whole"):
+        _view_pipeline(2, 2, (64,))
+
+
 @pytest.mark.parametrize("first,second", [(2, 4), (4, 2), (3, 1), (1, 3), (3, 3)])
 @pytest.mark.parametrize("flat_alloc", [False, True])
 def test_inject_software_pipeline_sibling_buffers(first, second, flat_alloc):

@@ -56,8 +56,18 @@ Layout ExpandAnnotatedLayoutForMultiVersionedBuffer(const Layout &layout,
     return Layout();
   }
 
+  // A layout annotated through a same-dtype view (T.reshape) has the buffer's
+  // element count; one that already has the version dimension does not.
   arith::Analyzer analyzer;
-  if (!ShapesEqual(layout->InputShape(), old_buffer->shape, &analyzer)) {
+  auto num_elements = [](const Array<PrimExpr> &shape) {
+    PrimExpr n = make_const(DataType::Int(64), 1);
+    for (const PrimExpr &dim : shape) {
+      n = n * cast(DataType::Int(64), dim);
+    }
+    return n;
+  };
+  if (!analyzer.CanProveEqual(num_elements(layout->InputShape()),
+                              num_elements(old_buffer->shape))) {
     return Layout();
   }
 
@@ -97,7 +107,7 @@ bool UpdateExpandedLayoutMapForRemappedAllocs(
   std::unordered_set<const VarNode *> visited;
   bool changed = false;
   for (const auto &[old_buffer, new_buffer] : remapped_allocs) {
-    if (!visited.insert(old_buffer->data.get()).second ||
+    if (visited.count(old_buffer->data.get()) ||
         !updated_layout_map.count(old_buffer->data)) {
       continue;
     }
@@ -107,6 +117,7 @@ bool UpdateExpandedLayoutMapForRemappedAllocs(
     if (!expanded.defined()) {
       continue;
     }
+    visited.insert(old_buffer->data.get());
     updated_layout_map.Set(old_buffer->data, expanded);
     changed = true;
   }
@@ -416,9 +427,13 @@ private:
     }
     PropagateScalarDependencyRoles(pipeline_stmts, &roles);
 
-    std::unordered_set<const BufferNode *> consumer_used, producer_used;
-    std::unordered_map<const BufferNode *, size_t> first_write_index;
-    std::unordered_map<const BufferNode *, size_t> last_read_index;
+    // Keyed by buffer data so accesses through a view (T.reshape/T.view)
+    // count for the buffer.
+    VarSet consumer_used, producer_used;
+    std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual>
+        first_write_index;
+    std::unordered_map<Var, size_t, ObjectPtrHash, ObjectPtrEqual>
+        last_read_index;
     auto is_copy_stage = [&](size_t idx) {
       bool has_shared_write = false;
       for (const BufferRegion &wr : writes[idx]) {
@@ -444,35 +459,35 @@ private:
                          (roles[i] == Role::kBoth && !copy_stage);
       if (is_producer) {
         for (BufferRegion br : writes[i]) {
-          producer_used.insert(br->buffer.get());
+          producer_used.insert(br->buffer->data);
         }
       }
       if (is_consumer) {
         for (BufferRegion br : reads[i]) {
-          consumer_used.insert(br->buffer.get());
+          consumer_used.insert(br->buffer->data);
         }
       }
       for (BufferRegion br : writes[i]) {
-        const BufferNode *buf = br->buffer.get();
+        const Var &buf = br->buffer->data;
         if (!first_write_index.count(buf)) {
           first_write_index[buf] = i;
         }
       }
       for (BufferRegion br : reads[i]) {
-        last_read_index[br->buffer.get()] = i;
+        last_read_index[br->buffer->data] = i;
       }
     }
     Array<Buffer> versioned_buffers;
     for (Buffer buffer : scoped_buffers) {
-      if (consumer_used.count(buffer.get()) &&
-          producer_used.count(buffer.get())) {
+      if (consumer_used.count(buffer->data) &&
+          producer_used.count(buffer->data)) {
         versioned_buffers.push_back(buffer);
         continue;
       }
       // Fallback: if we saw a write before a later read, the buffer spans
       // multiple stages even if role classification missed one side.
-      auto it_w = first_write_index.find(buffer.get());
-      auto it_r = last_read_index.find(buffer.get());
+      auto it_w = first_write_index.find(buffer->data);
+      auto it_r = last_read_index.find(buffer->data);
       if (it_w != first_write_index.end() && it_r != last_read_index.end() &&
           it_w->second < it_r->second) {
         if (!is_copy_stage(it_w->second))
@@ -575,6 +590,7 @@ private:
     Array<Buffer> scoped_buffers = CollectScopedBuffers();
     Array<Buffer> versioned_buffers = GetVersionedBuffers(
         GetPipelineTopLevelStmts(pipeline_body), scoped_buffers);
+    versioned_buffers = KeepAllocationPerData(versioned_buffers);
 
     std::unordered_set<const BufferNode *> already;
     for (const Buffer &buffer : versioned_buffers) {
@@ -598,6 +614,39 @@ private:
     return versioned_buffers;
   }
 
+  // Version one buffer per data, preferring the allocation; views
+  // (T.reshape/T.view) of it are versioned on access.
+  Array<Buffer> KeepAllocationPerData(const Array<Buffer> &buffers) const {
+    std::unordered_set<Buffer, ObjectPtrHash, ObjectPtrEqual> allocations;
+    for (const StmtNode *stmt : stmt_stack_) {
+      if (!stmt->IsInstance<SBlockNode>()) {
+        continue;
+      }
+      const auto *block = static_cast<const SBlockNode *>(stmt);
+      auto it = block_alloc_buffers_.find(block);
+      for (const Buffer &buffer : it != block_alloc_buffers_.end()
+                                      ? it->second
+                                      : block->alloc_buffers) {
+        allocations.insert(buffer);
+      }
+    }
+    std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> chosen;
+    for (const Buffer &buffer : buffers) {
+      auto [it, inserted] = chosen.emplace(buffer->data, buffer);
+      if (!inserted && !allocations.count(it->second) &&
+          allocations.count(buffer)) {
+        it->second = buffer;
+      }
+    }
+    Array<Buffer> result;
+    for (const Buffer &buffer : buffers) {
+      if (chosen.at(buffer->data).same_as(buffer)) {
+        result.push_back(buffer);
+      }
+    }
+    return result;
+  }
+
   void EnsureVersionedBuffers(const Array<Buffer> &versioned_buffers,
                               int num_stages) {
     for (const Buffer &buffer : versioned_buffers) {
@@ -607,10 +656,35 @@ private:
       Var buffer_var = buffer->data;
       Buffer new_buffer = RewriteAllocBuffer(buffer, num_stages);
       buffer_remap_.Set(buffer, new_buffer);
+      versioned_data_.emplace(buffer_var, buffer);
       if (!buffer_data_to_buffer_.count(buffer_var)) {
         buffer_data_to_buffer_.Set(buffer_var, buffer);
       }
     }
+  }
+
+  // Versioned counterpart of a buffer. Inside a pipeline stage, a view
+  // (T.reshape/T.view) of a versioned buffer is versioned like the buffer;
+  // outside, it keeps addressing version 0.
+  Optional<Buffer> GetVersionedBuffer(const Buffer &buffer) {
+    if (auto versioned = buffer_remap_.Get(buffer)) {
+      return versioned;
+    }
+    auto it = versioned_data_.find(buffer->data);
+    if (it == versioned_data_.end() || buffer.scope() == "shared.barrier" ||
+        buffer.scope() == "shared.cluster_barrier" ||
+        !version_index_.defined()) {
+      return std::nullopt;
+    }
+    if (auto versioned = view_remap_.Get(buffer)) {
+      return versioned;
+    }
+    const Buffer &base = it->second;
+    CheckPipelineViewCoversBuffer(buffer, base, &analyzer_);
+    int num_versions = Downcast<IntImm>(buffer_remap_[base]->shape[0])->value;
+    Buffer new_buffer = RewriteAllocBuffer(buffer, num_versions);
+    view_remap_.Set(buffer, new_buffer);
+    return new_buffer;
   }
 
   PrimExpr CurrentVersionIndex() const { return version_index_; }
@@ -751,12 +825,12 @@ private:
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
-    auto it = buffer_remap_.find(load->buffer);
-    if (it == buffer_remap_.end()) {
+    Optional<Buffer> versioned = GetVersionedBuffer(load->buffer);
+    if (!versioned) {
       return std::move(load);
     }
     Buffer old_buffer = load->buffer;
-    const Buffer &new_buffer = (*it).second;
+    const Buffer &new_buffer = versioned.value();
     PrimExpr version_index = CurrentVersionIndex();
     ICHECK(version_index.defined())
         << "Versioned buffer load escaped pipeline stage context";
@@ -776,12 +850,12 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
-    auto it = buffer_remap_.find(store->buffer);
-    if (it == buffer_remap_.end()) {
+    Optional<Buffer> versioned = GetVersionedBuffer(store->buffer);
+    if (!versioned) {
       return std::move(store);
     }
     Buffer old_buffer = store->buffer;
-    const Buffer &new_buffer = (*it).second;
+    const Buffer &new_buffer = versioned.value();
     PrimExpr version_index = CurrentVersionIndex();
     ICHECK(version_index.defined())
         << "Versioned buffer store escaped pipeline stage context";
@@ -891,24 +965,42 @@ private:
       auto buffer_var = Downcast<Var>(call->args[i]);
       if (!buffer_data_to_buffer_.count(buffer_var))
         continue;
-      const Buffer &buffer = buffer_data_to_buffer_[buffer_var];
-      auto it = buffer_remap_.find(buffer);
-      if (it != buffer_remap_.end()) {
-        PrimExpr version_index = CurrentVersionIndex();
-        ICHECK(version_index.defined())
-            << "Versioned access_ptr escaped pipeline stage context";
-        const Buffer &new_buffer = (*it).second;
-        const PrimExpr &old_index = call->args[i + 1];
-        PrimExpr offset;
-        if (new_buffer->strides.empty()) {
-          offset = product(buffer->shape, old_index.dtype());
-        } else {
-          offset = tvm::cast(old_index.dtype(), new_buffer->strides[0]);
-        }
-        PrimExpr typed_version = tvm::cast(old_index.dtype(), version_index);
-        PrimExpr new_index = old_index + typed_version * offset;
-        new_args.Set(i + 1, new_index);
+      // Key on the data so any view of a versioned buffer gets its offset.
+      Buffer buffer;
+      if (auto it = versioned_data_.find(buffer_var);
+          it != versioned_data_.end()) {
+        buffer = it->second;
+      } else if (buffer_data_to_buffer_.count(buffer_var) &&
+                 buffer_remap_.count(buffer_data_to_buffer_[buffer_var])) {
+        buffer = buffer_data_to_buffer_[buffer_var];
+      } else {
+        continue;
       }
+      PrimExpr version_index = CurrentVersionIndex();
+      ICHECK(version_index.defined())
+          << "Versioned access_ptr escaped pipeline stage context";
+      const Buffer &new_buffer = buffer_remap_[buffer];
+      const PrimExpr &old_index = call->args[i + 1];
+      PrimExpr offset;
+      if (new_buffer->strides.empty()) {
+        offset = product(buffer->shape, old_index.dtype());
+      } else {
+        offset = tvm::cast(old_index.dtype(), new_buffer->strides[0]);
+      }
+      // The offset is in elements of the pointer type, which a view may
+      // change.
+      DataType ptr_type = call->args[0].dtype();
+      int64_t buffer_bits =
+          static_cast<int64_t>(buffer->dtype.bits()) * buffer->dtype.lanes();
+      int64_t ptr_bits =
+          static_cast<int64_t>(ptr_type.bits()) * ptr_type.lanes();
+      if (buffer_bits != ptr_bits) {
+        offset = floordiv(offset * make_const(offset.dtype(), buffer_bits),
+                          make_const(offset.dtype(), ptr_bits));
+      }
+      PrimExpr typed_version = tvm::cast(old_index.dtype(), version_index);
+      PrimExpr new_index = old_index + typed_version * offset;
+      new_args.Set(i + 1, new_index);
     }
     return Call(call->dtype, call->op, new_args, call->annotations, call->span);
   }
@@ -924,6 +1016,11 @@ private:
   Map<Var, Buffer> buffer_data_to_buffer_;
   Map<Buffer, Optional<Stmt>> buffer_lca_;
   Map<Buffer, Buffer> buffer_remap_;
+  // Data of each versioned buffer, to version its views on access.
+  std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>
+      versioned_data_;
+  Map<Buffer, Buffer> view_remap_;
+  arith::Analyzer analyzer_;
   // Remember each block's alloc list so the loop can see buffers defined in
   // parents.
   std::unordered_map<const SBlockNode *, Array<Buffer>> block_alloc_buffers_;

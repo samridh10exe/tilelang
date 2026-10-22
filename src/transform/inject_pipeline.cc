@@ -58,8 +58,9 @@ using BufferMap =
     std::unordered_map<Buffer, Buffer, ObjectPtrHash, ObjectPtrEqual>;
 using BufferShapeMap =
     std::unordered_map<Buffer, PrimExpr, ObjectPtrHash, ObjectPtrEqual>;
+// Keyed by buffer data so writes and reads through views of one buffer match.
 using BufferCommitGroupMap =
-    std::unordered_map<Buffer, int, ObjectPtrHash, ObjectPtrEqual>;
+    std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual>;
 using BlockDependencyGraph =
     std::unordered_map<SBlock, Array<SBlock>, ObjectPtrHash, ObjectPtrEqual>;
 
@@ -82,9 +83,86 @@ struct BufferAccessInfo {
 struct PipelineRewriteResult {
   Stmt pipeline;
   Map<Buffer, Buffer> buffer_remap;
+  // Views (T.reshape/T.view) of buffers in buffer_remap, versioned the same.
+  Map<Buffer, Buffer> view_remap;
 };
 
 namespace {
+
+/*! \brief Add a leading version dimension of extent num_versions. */
+Buffer ExpandPipelineBuffer(const Buffer &buffer, int num_versions) {
+  ObjectPtr<BufferNode> new_buffer = make_object<BufferNode>(*(buffer.get()));
+  new_buffer->shape.insert(new_buffer->shape.begin(), PrimExpr(num_versions));
+  if (!new_buffer->strides.empty()) {
+    ICHECK(new_buffer->strides.size() + 1 == new_buffer->shape.size());
+    PrimExpr stride_0 = new_buffer->strides[0] * new_buffer->shape[1];
+    new_buffer->strides.insert(new_buffer->strides.begin(), stride_0);
+  }
+  return Buffer(new_buffer);
+}
+
+bool IsBarrierBuffer(const Buffer &buffer) {
+  return buffer.scope() == "shared.barrier" ||
+         buffer.scope() == "shared.cluster_barrier";
+}
+
+/*!
+ * \brief Multi-versioned counterparts of the buffers in a pipeline.
+ *
+ * A view (T.reshape/T.view) shares its buffer's data, so it is versioned like
+ * the buffer when first accessed.
+ */
+class PipelineBufferVersions {
+public:
+  explicit PipelineBufferVersions(Map<Buffer, Buffer> buffer_remap)
+      : buffer_remap_(std::move(buffer_remap)) {
+    for (const auto &[buffer, versioned] : buffer_remap_) {
+      base_of_data_.emplace(buffer->data, buffer);
+    }
+  }
+
+  Optional<Buffer> Get(const Buffer &buffer) {
+    if (auto versioned = buffer_remap_.Get(buffer)) {
+      return versioned;
+    }
+    if (auto versioned = view_remap_.Get(buffer)) {
+      return versioned;
+    }
+    auto it = base_of_data_.find(buffer->data);
+    if (it == base_of_data_.end() || IsBarrierBuffer(it->second)) {
+      return std::nullopt;
+    }
+    // A buffer that an inner pipeline already versioned is larger; leave it.
+    if (analyzer_.CanProve(PipelineBufferStorageBits(buffer) >
+                           PipelineBufferStorageBits(it->second))) {
+      return std::nullopt;
+    }
+    CheckPipelineViewCoversBuffer(buffer, it->second, &analyzer_);
+    int num_versions =
+        Downcast<IntImm>(buffer_remap_.at(it->second)->shape[0])->value;
+    Buffer versioned = ExpandPipelineBuffer(buffer, num_versions);
+    view_remap_.Set(buffer, versioned);
+    return versioned;
+  }
+
+  /*! \brief The original buffer that owns data, and its versioned counterpart.
+   */
+  std::optional<std::pair<Buffer, Buffer>> GetByData(const Var &data) const {
+    auto it = base_of_data_.find(data);
+    if (it == base_of_data_.end()) {
+      return std::nullopt;
+    }
+    return std::make_pair(it->second, buffer_remap_.at(it->second));
+  }
+
+  const Map<Buffer, Buffer> &ViewRemap() const { return view_remap_; }
+
+private:
+  Map<Buffer, Buffer> buffer_remap_;
+  Map<Buffer, Buffer> view_remap_;
+  std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> base_of_data_;
+  arith::Analyzer analyzer_;
+};
 
 bool GetBoolAnnotation(const CopyNode &op, const char *key) {
   if (auto val = op.annotations.Get(key)) {
@@ -146,8 +224,18 @@ Layout ExpandAnnotatedLayoutForMultiVersionedBuffer(const Layout &layout,
     return Layout();
   }
 
+  // A layout annotated through a same-dtype view (T.reshape) has the buffer's
+  // element count; one that already has the version dimension does not.
   arith::Analyzer analyzer;
-  if (!ShapesEqual(layout->InputShape(), old_buffer->shape, &analyzer)) {
+  auto num_elements = [](const Array<PrimExpr> &shape) {
+    PrimExpr n = make_const(DataType::Int(64), 1);
+    for (const PrimExpr &dim : shape) {
+      n = n * cast(DataType::Int(64), dim);
+    }
+    return n;
+  };
+  if (!analyzer.CanProveEqual(num_elements(layout->InputShape()),
+                              num_elements(old_buffer->shape))) {
     return Layout();
   }
 
@@ -172,7 +260,11 @@ public:
   BufferUsageCollector(const Map<Var, Buffer> &buffer_data_to_buffer,
                        const BufferSet &allocated_buffers)
       : buffer_data_to_buffer_(buffer_data_to_buffer),
-        allocated_buffers_(allocated_buffers) {}
+        allocated_buffers_(allocated_buffers) {
+    for (const Buffer &buffer : allocated_buffers) {
+      allocation_of_data_.emplace(buffer->data, buffer);
+    }
+  }
 
   Array<Buffer> Collect(const Stmt &stmt) {
     this->VisitStmt(stmt);
@@ -229,14 +321,20 @@ private:
   }
 
   void AddBuffer(const Buffer &buffer) {
-    // Only add buffers that are allocated (not function input/output buffers)
+    // Only add buffers that are allocated (not function input/output buffers).
+    // An access through a view (T.reshape/T.view) uses its allocation.
     if (allocated_buffers_.count(buffer)) {
       used_buffers_.insert(buffer);
+    } else if (auto it = allocation_of_data_.find(buffer->data);
+               it != allocation_of_data_.end()) {
+      used_buffers_.insert(it->second);
     }
   }
 
   const Map<Var, Buffer> &buffer_data_to_buffer_;
   const BufferSet &allocated_buffers_;
+  std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual>
+      allocation_of_data_;
   BufferSet used_buffers_;
 };
 
@@ -401,16 +499,16 @@ private:
 } // namespace
 
 bool IsReplayableScalarBindBlock(const SBlock &block,
-                                 const BufferSet &pipeline_write_buffers) {
+                                 const BufferDataSet &pipeline_write_buffers) {
   return tl::IsReplayableScalarBind(block->body, block->reads,
                                     pipeline_write_buffers);
 }
 
-BufferSet CollectPipelineWriteBuffers(const Array<SBlock> &blocks) {
-  BufferSet write_buffers;
+BufferDataSet CollectPipelineWriteBuffers(const Array<SBlock> &blocks) {
+  BufferDataSet write_buffers;
   for (const SBlock &block : blocks) {
     for (const BufferRegion &write : block->writes) {
-      write_buffers.insert(write->buffer);
+      write_buffers.insert(write->buffer->data);
     }
   }
   return write_buffers;
@@ -436,7 +534,7 @@ bool UpdateExpandedLayoutMapForRemappedAllocs(
   VarSet visited;
   bool changed = false;
   for (const auto &[old_buffer, new_buffer] : remapped_allocs) {
-    if (!visited.insert(old_buffer->data).second ||
+    if (visited.count(old_buffer->data) ||
         !updated_layout_map.count(old_buffer->data)) {
       continue;
     }
@@ -446,6 +544,7 @@ bool UpdateExpandedLayoutMapForRemappedAllocs(
     if (!expanded.defined()) {
       continue;
     }
+    visited.insert(old_buffer->data);
     updated_layout_map.Set(old_buffer->data, expanded);
     changed = true;
   }
@@ -1034,19 +1133,17 @@ public:
    * buffers are accessed.
    */
   PipelineBodyRewriter(const Map<Var, Buffer> &buffer_data_to_buffer,
-                       const Map<Buffer, Buffer> &buffer_remap,
-                       For pipeline_loop, bool access_all_versions)
-      : buffer_data_to_buffer_(buffer_data_to_buffer),
-        buffer_remap_(buffer_remap), pipeline_loop_(std::move(pipeline_loop)),
+                       PipelineBufferVersions *versions, For pipeline_loop,
+                       bool access_all_versions)
+      : buffer_data_to_buffer_(buffer_data_to_buffer), versions_(versions),
+        pipeline_loop_(std::move(pipeline_loop)),
         access_all_versions_(access_all_versions) {}
 
 private:
-  BufferRegion
-  RewritePipelineBufferRegion(const BufferRegion &buffer_region) const {
-    auto it = buffer_remap_.find(buffer_region->buffer);
-    if (it != buffer_remap_.end()) {
+  BufferRegion RewritePipelineBufferRegion(const BufferRegion &buffer_region) {
+    if (Optional<Buffer> versioned = versions_->Get(buffer_region->buffer)) {
       Region new_region = buffer_region->region;
-      const Buffer &new_buffer = (*it).second;
+      const Buffer &new_buffer = versioned.value();
       // For pipeline buffers, relax the access region of the first dimension to
       // full extent if access_all_versions == true
       Range accessed_version =
@@ -1074,28 +1171,29 @@ private:
     Array<PrimExpr> new_args = call->args;
     for (int i : arg_indices) {
       auto buffer_var = Downcast<Var>(call->args[i]);
-      auto buf_it = buffer_data_to_buffer_.find(buffer_var);
-      if (buf_it == buffer_data_to_buffer_.end()) {
+      auto versioned = versions_->GetByData(buffer_var);
+      if (!versioned) {
         continue;
       }
-      const Buffer &buffer = (*buf_it).second;
-      auto it = buffer_remap_.find(buffer);
-      if (it != buffer_remap_.end()) {
-        const Buffer &new_buffer = (*it).second;
-        const PrimExpr &old_index = call->args[i + 1];
-        PrimExpr offset;
-        if (new_buffer->strides.empty()) {
-          offset = product(buffer->shape);
-        } else {
-          offset = new_buffer->strides[0];
-        }
-        PrimExpr new_index =
-            old_index +
-            floormod((pipeline_loop_->loop_var - pipeline_loop_->min),
-                     new_buffer->shape[0]) *
-                offset;
-        new_args.Set(i + 1, new_index);
+      const auto &[buffer, new_buffer] = versioned.value();
+      const PrimExpr &old_index = call->args[i + 1];
+      PrimExpr offset = new_buffer->strides.empty() ? product(buffer->shape)
+                                                    : new_buffer->strides[0];
+      // The offset is in elements of the pointer type, which a view may change.
+      int64_t buffer_bits =
+          static_cast<int64_t>(buffer->dtype.bits()) * buffer->dtype.lanes();
+      DataType ptr_type = call->args[0].dtype();
+      int64_t ptr_bits =
+          static_cast<int64_t>(ptr_type.bits()) * ptr_type.lanes();
+      if (buffer_bits != ptr_bits) {
+        offset = floordiv(offset * make_const(offset.dtype(), buffer_bits),
+                          make_const(offset.dtype(), ptr_bits));
       }
+      PrimExpr new_index =
+          old_index + floormod((pipeline_loop_->loop_var - pipeline_loop_->min),
+                               new_buffer->shape[0]) *
+                          offset;
+      new_args.Set(i + 1, new_index);
     }
     return Call(call->dtype, call->op, new_args, call->annotations, call->span);
   }
@@ -1120,11 +1218,11 @@ private:
 
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     BufferStore store = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
-    auto it = buffer_remap_.find(store->buffer);
-    if (it == buffer_remap_.end()) {
+    Optional<Buffer> versioned = versions_->Get(store->buffer);
+    if (!versioned) {
       return store;
     }
-    const Buffer &new_buffer = (*it).second;
+    const Buffer &new_buffer = versioned.value();
     auto *n = store.CopyOnWrite();
     n->buffer = new_buffer;
     PrimExpr version = floormod(
@@ -1135,11 +1233,11 @@ private:
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     BufferLoad load = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
-    auto it = buffer_remap_.find(load->buffer);
-    if (it == buffer_remap_.end()) {
+    Optional<Buffer> versioned = versions_->Get(load->buffer);
+    if (!versioned) {
       return load;
     }
-    const Buffer &new_buffer = (*it).second;
+    const Buffer &new_buffer = versioned.value();
     auto *n = load.CopyOnWrite();
     n->buffer = new_buffer;
     PrimExpr version = floormod(
@@ -1173,7 +1271,7 @@ private:
   }
 
   Map<Var, Buffer> buffer_data_to_buffer_;
-  Map<Buffer, Buffer> buffer_remap_;
+  PipelineBufferVersions *versions_;
   For pipeline_loop_;
   bool access_all_versions_;
 };
@@ -1231,6 +1329,7 @@ public:
         buffer_remap_.Set(buffer, RewriteAllocBuffer(buffer, num_versions));
       }
     }
+    versions_ = std::make_unique<PipelineBufferVersions>(buffer_remap_);
     std::vector<std::pair<int, SBlock>> ordered_blocks;
     for (const auto &[block, anno] : pipeline_info_) {
       ordered_blocks.emplace_back(anno.order, block);
@@ -1298,6 +1397,11 @@ public:
    * This is used to update alloc_buffers in outer blocks.
    */
   const Map<Buffer, Buffer> &GetBufferRemap() const { return buffer_remap_; }
+
+  /*! \brief Views of remapped buffers that the pipeline body accesses. */
+  Map<Buffer, Buffer> GetViewRemap() const {
+    return versions_ ? versions_->ViewRemap() : Map<Buffer, Buffer>();
+  }
 
 private:
   struct ScalarBinding {
@@ -1395,7 +1499,7 @@ private:
                                      const PrimExpr &access_index) {
     const ScalarBinding &binding = scalar_bindings_[binding_index];
     Stmt bind = Bind(binding.var, binding.value, binding.span);
-    bind = PipelineBodyRewriter(buffer_data_to_buffer_, buffer_remap_,
+    bind = PipelineBodyRewriter(buffer_data_to_buffer_, versions_.get(),
                                 pipeline_loop_, max_stage_ != 1)(bind);
     bind = Substitute(bind, {{pipeline_loop_->loop_var, access_index}});
     return bind;
@@ -1432,16 +1536,28 @@ private:
   GetBufferAccessInfo() {
     std::unordered_map<Buffer, BufferAccessInfo, ObjectPtrHash, ObjectPtrEqual>
         infos;
+    // Count accesses through a view (T.reshape/T.view) against the allocation.
+    std::unordered_map<Var, Buffer, ObjectPtrHash, ObjectPtrEqual> alloc_of;
+    for (const Buffer &alloc : pipeline_allocs_) {
+      if (!IsBarrierBuffer(alloc)) {
+        alloc_of.emplace(alloc->data, alloc);
+      }
+    }
+    auto owner = [&](const Buffer &buffer) {
+      auto it = alloc_of.find(buffer->data);
+      return it == alloc_of.end() ? buffer : it->second;
+    };
     for (const auto &pair : pipeline_info_) {
       const SBlock &block = pair.first;
       int stage = pair.second.stage;
       max_stage_ = std::max(max_stage_, stage);
 
       for (const BufferRegion &write : block->writes) {
-        if (!infos.count(write->buffer)) {
-          infos.emplace(write->buffer, BufferAccessInfo{});
+        Buffer buffer = owner(write->buffer);
+        if (!infos.count(buffer)) {
+          infos.emplace(buffer, BufferAccessInfo{});
         }
-        auto &info = infos.at(write->buffer);
+        auto &info = infos.at(buffer);
         if (info.def == -1) {
           info.def = stage;
         } else {
@@ -1450,10 +1566,11 @@ private:
       }
 
       for (const BufferRegion &read : block->reads) {
-        if (!infos.count(read->buffer)) {
-          infos.emplace(read->buffer, BufferAccessInfo{});
+        Buffer buffer = owner(read->buffer);
+        if (!infos.count(buffer)) {
+          infos.emplace(buffer, BufferAccessInfo{});
         }
-        auto &info = infos.at(read->buffer);
+        auto &info = infos.at(buffer);
         info.use = std::max(info.use, stage);
       }
     }
@@ -1497,11 +1614,11 @@ private:
         const SBlock &writer_block = pair1.first;
         const auto &writer_info = pair1.second;
 
-        auto it1 = std::find_if(writer_block->writes.begin(),
-                                writer_block->writes.end(),
-                                [&](const BufferRegion &buffer_region) {
-                                  return buffer_region->buffer.same_as(buffer);
-                                });
+        auto it1 = std::find_if(
+            writer_block->writes.begin(), writer_block->writes.end(),
+            [&](const BufferRegion &buffer_region) {
+              return buffer_region->buffer->data.same_as(buffer->data);
+            });
         if (it1 == writer_block->writes.end()) {
           continue;
         }
@@ -1512,7 +1629,7 @@ private:
           auto it2 = std::find_if(
               reader_block->reads.begin(), reader_block->reads.end(),
               [&](const BufferRegion &buffer_region) {
-                return buffer_region->buffer.same_as(buffer);
+                return buffer_region->buffer->data.same_as(buffer->data);
               });
           if (it2 == reader_block->reads.end()) {
             continue;
@@ -1539,24 +1656,17 @@ private:
    * \return The resized buffer.
    */
   Buffer RewriteAllocBuffer(const Buffer &buffer, int num_versions) {
-    ObjectPtr<BufferNode> new_buffer = make_object<BufferNode>(*(buffer.get()));
-    new_buffer->shape.insert(new_buffer->shape.begin(), PrimExpr(num_versions));
-    if (!new_buffer->strides.empty()) {
-      ICHECK(new_buffer->strides.size() + 1 == new_buffer->shape.size());
-      PrimExpr stride_0 = new_buffer->strides[0] * new_buffer->shape[1];
-      new_buffer->strides.insert(new_buffer->strides.begin(), stride_0);
-    }
-    return Buffer(new_buffer);
+    return ExpandPipelineBuffer(buffer, num_versions);
   }
 
   struct AsyncStateGlobal {
-    BufferSet dst_buffers;
+    VarSet dst_buffers;
     BufferCommitGroupMap buffer_to_commit_group;
     int commit_group_count{0};
     Optional<PrimExpr> producer_head{PrimExpr(-1)};
 
     bool writes(const Buffer &buffer) const {
-      return dst_buffers.count(buffer) > 0;
+      return dst_buffers.count(buffer->data) > 0;
     }
   };
 
@@ -2601,8 +2711,8 @@ private:
             if (!global_state.writes(read_region->buffer)) {
               continue;
             }
-            auto it =
-                global_state.buffer_to_commit_group.find(read_region->buffer);
+            auto it = global_state.buffer_to_commit_group.find(
+                read_region->buffer->data);
             if (it == global_state.buffer_to_commit_group.end()) {
               handled = false;
               break;
@@ -2660,7 +2770,8 @@ private:
         if (!async_states_[producer_stage_idx].writes(read_region->buffer)) {
           continue;
         }
-        auto commit_group_id = buffer_to_commit_group.at(read_region->buffer);
+        auto commit_group_id =
+            buffer_to_commit_group.at(read_region->buffer->data);
         ICHECK_GE(commit_group_id, 0);
         ICHECK_LT(commit_group_id, num_commit_group);
         if (!need_wait_count[commit_group_id]) {
@@ -2891,7 +3002,7 @@ private:
       SBlock annotated_block =
           Downcast<SBlock>(AnnotateTileOpMbarPhase(block, mbar_phase));
       SBlock new_block = Downcast<SBlock>(PipelineBodyRewriter(
-          buffer_data_to_buffer_, buffer_remap_, pipeline_loop_,
+          buffer_data_to_buffer_, versions_.get(), pipeline_loop_,
           max_stage_ != 1)(annotated_block));
 
       PrimExpr delta = start - pipeline_loop_->min;
@@ -2959,13 +3070,13 @@ private:
 
         for (const BufferRegion &write_region : new_block->writes) {
           auto &global_state = async_states_[stage];
-          global_state.dst_buffers.insert(write_region->buffer);
-          global_state.buffer_to_commit_group[write_region->buffer] =
+          global_state.dst_buffers.insert(write_region->buffer->data);
+          global_state.buffer_to_commit_group[write_region->buffer->data] =
               commit_group_id;
           global_state.commit_group_count =
               std::max(global_state.commit_group_count,
                        static_cast<int>(local_state.commit_groups.size()));
-          buffer_to_commit_group[write_region->buffer] = commit_group_id;
+          buffer_to_commit_group[write_region->buffer->data] = commit_group_id;
         }
         async_states_[stage].producer_head = normalized_access_index;
         local_state.producer_head = normalized_access_index;
@@ -3052,6 +3163,7 @@ private:
   Array<SBlock> scalar_binding_blocks_;
   int max_stage_ = -1;
   Map<Buffer, Buffer> buffer_remap_;
+  std::unique_ptr<PipelineBufferVersions> versions_;
   Optional<Target> target_;
   Map<Var, arith::IntSet> thread_domains_;
   Array<SBlock> ordered_stmts_;
@@ -3073,6 +3185,7 @@ PipelineRewriteResult RewritePipeline(
   PipelineRewriteResult result;
   result.pipeline = rewriter.BuildPipeline();
   result.buffer_remap = rewriter.GetBufferRemap();
+  result.view_remap = rewriter.GetViewRemap();
   return result;
 }
 
@@ -3089,13 +3202,40 @@ public:
     for (const auto &[old_buffer, new_buffer] : replacements_) {
       if (old_buffer->shape.size() < new_buffer->shape.size()) {
         remapped_allocs_.emplace_back(old_buffer, new_buffer);
+        versions_of_data_.emplace(
+            old_buffer->data,
+            static_cast<int>(Downcast<IntImm>(new_buffer->shape[0])->value));
       }
+      replacement_targets_.insert(new_buffer);
     }
   }
 
 private:
-  BufferRegion RewriteBufferRegion(const BufferRegion &region) const {
-    if (auto new_buffer = replacements_.Get(region->buffer)) {
+  // A view (T.reshape/T.view) used only outside the pipelines is resized like
+  // its buffer, and its accesses use version 0.
+  Optional<Buffer> GetReplacement(const Buffer &buffer) {
+    if (auto new_buffer = replacements_.Get(buffer)) {
+      return new_buffer;
+    }
+    auto it = versions_of_data_.find(buffer->data);
+    if (it == versions_of_data_.end() || IsBarrierBuffer(buffer) ||
+        replacement_targets_.count(buffer)) {
+      return std::nullopt;
+    }
+    // A partial view (e.g. epilogue scratch) keeps addressing version 0.
+    for (const auto &[old_buffer, new_buffer] : remapped_allocs_) {
+      if (old_buffer->data.same_as(buffer->data) &&
+          !PipelineViewCoversBuffer(buffer, old_buffer, &analyzer_)) {
+        return std::nullopt;
+      }
+    }
+    Buffer resized = ExpandPipelineBuffer(buffer, it->second);
+    replacements_.Set(buffer, resized);
+    return resized;
+  }
+
+  BufferRegion RewriteBufferRegion(const BufferRegion &region) {
+    if (auto new_buffer = GetReplacement(region->buffer)) {
       Region bounds = region->region;
       if (bounds.size() < new_buffer.value()->shape.size()) {
         ICHECK_EQ(bounds.size() + 1, new_buffer.value()->shape.size());
@@ -3108,7 +3248,7 @@ private:
 
   PrimExpr VisitExpr_(const BufferLoadNode *op) final {
     auto node = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
-    if (auto new_buf = replacements_.Get(node->buffer)) {
+    if (auto new_buf = GetReplacement(node->buffer)) {
       auto *n = node.CopyOnWrite();
       n->buffer = new_buf.value();
       if (n->indices.size() < n->buffer->shape.size()) {
@@ -3120,7 +3260,7 @@ private:
   }
   Stmt VisitStmt_(const BufferStoreNode *op) final {
     auto node = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
-    if (auto new_buf = replacements_.Get(node->buffer)) {
+    if (auto new_buf = GetReplacement(node->buffer)) {
       auto *n = node.CopyOnWrite();
       n->buffer = new_buf.value();
       if (n->indices.size() < n->buffer->shape.size()) {
@@ -3146,7 +3286,7 @@ private:
     return call;
   }
   Stmt VisitStmt_(const DeclBufferNode *op) final {
-    if (auto new_buf = replacements_.Get(op->buffer)) {
+    if (auto new_buf = GetReplacement(op->buffer)) {
       ObjectPtr<DeclBufferNode> n = make_object<DeclBufferNode>(*op);
       n->buffer = new_buf.value();
       return DeclBuffer(n);
@@ -3200,6 +3340,9 @@ private:
   }
   Map<Buffer, Buffer> replacements_;
   std::vector<std::pair<Buffer, Buffer>> remapped_allocs_;
+  std::unordered_map<Var, int, ObjectPtrHash, ObjectPtrEqual> versions_of_data_;
+  BufferSet replacement_targets_;
+  arith::Analyzer analyzer_;
 };
 
 class PipelineInjector : private StmtExprMutator {
@@ -3427,6 +3570,26 @@ private:
       }
       buffer_expansions_.erase(buffer);
     }
+    // Each pipeline versioned the views of this buffer by its own stage count;
+    // resize them all to the allocation's.
+    if (allocation->shape.size() <= buffer->shape.size()) {
+      return;
+    }
+    int num_versions = Downcast<IntImm>(allocation->shape[0])->value;
+    Array<Buffer> views;
+    for (const auto &[view, _] : buffer_expansions_) {
+      if (view->data.same_as(buffer->data) && !view.same_as(buffer)) {
+        views.push_back(view);
+      }
+    }
+    for (const Buffer &view : views) {
+      Buffer resized = ExpandPipelineBuffer(view, num_versions);
+      replacements->Set(view, resized);
+      for (const Buffer &expanded : buffer_expansions_.at(view)) {
+        replacements->Set(expanded, resized);
+      }
+      buffer_expansions_.erase(view);
+    }
   }
 
   Stmt VisitStmt_(const SeqStmtNode *op) final {
@@ -3573,7 +3736,7 @@ private:
         }
       }
     }
-    BufferSet pipeline_write_buffers =
+    BufferDataSet pipeline_write_buffers =
         CollectPipelineWriteBuffers(original_order);
     Array<SBlock> scalar_binding_blocks;
     Array<SBlock> scheduled_order;
@@ -3963,6 +4126,12 @@ private:
         allocation = expanded;
       }
       pending_buffer_remap_.Set(buffer, allocation);
+    }
+    for (const auto &[view, expanded] : rewrite_result.view_remap) {
+      Array<Buffer> expansions =
+          buffer_expansions_.Get(view).value_or(Array<Buffer>{});
+      expansions.push_back(expanded);
+      buffer_expansions_.Set(view, expansions);
     }
     pipeline = LowerAsyncCommitWaitAttrs(pipeline);
 

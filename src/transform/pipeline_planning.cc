@@ -281,20 +281,19 @@ public:
     return {collector.GetReads(), collector.GetWrites()};
   }
 
-  BufferSet CollectPipelineWriteBuffers(const Array<Stmt> &stmts) const {
-    BufferSet write_buffers;
+  BufferDataSet CollectPipelineWriteBuffers(const Array<Stmt> &stmts) const {
+    BufferDataSet write_buffers;
     for (const Stmt &stmt : stmts) {
       auto [_, writes] = CollectStmtAccessRegions(stmt);
       for (const BufferRegion &write : writes) {
-        write_buffers.insert(write->buffer);
+        write_buffers.insert(write->buffer->data);
       }
     }
     return write_buffers;
   }
 
-  bool
-  IsReplayableScalarBindStmt(const Stmt &stmt,
-                             const BufferSet &pipeline_write_buffers) const {
+  bool IsReplayableScalarBindStmt(
+      const Stmt &stmt, const BufferDataSet &pipeline_write_buffers) const {
     auto [reads, _] = CollectStmtAccessRegions(stmt);
     return IsReplayableScalarBind(stmt, reads, pipeline_write_buffers);
   }
@@ -309,7 +308,7 @@ public:
   };
 
   ScheduledStmtAnalysis AnalyzeScheduledStmts(const Array<Stmt> &stmts) const {
-    BufferSet pipeline_write_buffers = CollectPipelineWriteBuffers(stmts);
+    BufferDataSet pipeline_write_buffers = CollectPipelineWriteBuffers(stmts);
     ScheduledStmtAnalysis analysis;
     analysis.original_stmt_count = stmts.size();
     analysis.replayable_bind_mask.reserve(stmts.size());

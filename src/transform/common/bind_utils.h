@@ -18,10 +18,13 @@ using namespace tirx;
 
 using BufferSet =
     std::unordered_set<Buffer, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
+// Buffer data vars, so that views (T.reshape/T.view) of a buffer match it.
+using BufferDataSet =
+    std::unordered_set<Var, ffi::ObjectPtrHash, ffi::ObjectPtrEqual>;
 
 inline bool IsReplayableScalarBind(const Stmt &stmt,
                                    const ffi::Array<BufferRegion> &reads,
-                                   const BufferSet &write_buffers) {
+                                   const BufferDataSet &write_buffers) {
   const auto *bind = stmt.as<BindNode>();
   if (bind == nullptr) {
     return false;
@@ -42,7 +45,7 @@ inline bool IsReplayableScalarBind(const Stmt &stmt,
     return false;
   }
   for (const BufferRegion &read : reads) {
-    if (write_buffers.count(read->buffer)) {
+    if (write_buffers.count(read->buffer->data)) {
       return false;
     }
   }

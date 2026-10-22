@@ -286,5 +286,45 @@ def test_reduce_absmax_after_reshape_3d():
     torch.testing.assert_close(B_torch, ref)
 
 
+def reshape_smem_pipelined_gemm(use, M=64, N=64, K=256, BK=32, num_stages=2):
+    @T.prim_func
+    def main(
+        A: T.Tensor((M, K), T.float16),
+        A_tiled: T.Tensor((K // BK, M * BK), T.float16),
+        B: T.Tensor((K, N), T.float16),
+        C: T.Tensor((M, N), T.float32),
+    ):
+        with T.Kernel(1, threads=128):
+            A_shared = T.alloc_shared((M, BK), T.float16)
+            A_flat = T.reshape(A_shared, (M * BK,))
+            A_view = T.reshape(A_shared, (M, BK))
+            B_shared = T.alloc_shared((BK, N), T.float16)
+            C_local = T.alloc_fragment((M, N), T.float32)
+            T.clear(C_local)
+            for k in T.Pipelined(K // BK, num_stages=num_stages):
+                if use == "copy_flat":
+                    # TMA cannot lower this 1-D copy on Hopper (independent of views).
+                    T.copy(A_tiled[k, :], A_flat, disable_tma=True)
+                else:
+                    T.copy(A[0, k * BK], A_view if use == "copy_and_gemm" else A_shared)
+                T.copy(B[k * BK, 0], B_shared)
+                T.gemm(A_shared if use == "copy_flat" else A_view, B_shared, C_local)
+            T.copy(C_local, C)
+
+    return tl.compile(main, out_idx=[3])
+
+
+@tilelang.testing.requires_cuda
+@pytest.mark.parametrize("use", ["copy_flat", "gemm", "copy_and_gemm"])
+def test_reshape_smem_pipelined(use):
+    """A pipelined shared buffer accessed through a view must still be multi-versioned."""
+    M, K, BK = 64, 256, 32
+    A = torch.randn(M, K, device="cuda", dtype=torch.float16)
+    B = torch.randn(K, 64, device="cuda", dtype=torch.float16)
+    A_tiled = A.view(M, K // BK, BK).transpose(0, 1).reshape(K // BK, M * BK).contiguous()
+    C = reshape_smem_pipelined_gemm(use)(A, A_tiled, B)
+    torch.testing.assert_close(C, A.float() @ B.float(), atol=1e-2, rtol=1e-2)
+
+
 if __name__ == "__main__":
     tilelang.testing.main()

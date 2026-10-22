@@ -146,19 +146,19 @@ private:
     return collector.Collect(stmt);
   }
 
-  BufferSet CollectWriteBuffers(const Array<Stmt> &stmts) const {
-    BufferSet write_buffers;
+  BufferDataSet CollectWriteBuffers(const Array<Stmt> &stmts) const {
+    BufferDataSet write_buffers;
     for (const Stmt &stmt : stmts) {
       auto [_, writes] = CollectStmtAccessRegions(stmt);
       for (const BufferRegion &write : writes) {
-        write_buffers.insert(write->buffer);
+        write_buffers.insert(write->buffer->data);
       }
     }
     return write_buffers;
   }
 
   bool IsReplayableBindStmt(const Stmt &stmt,
-                            const BufferSet &write_buffers) const {
+                            const BufferDataSet &write_buffers) const {
     auto [reads, _] = CollectStmtAccessRegions(stmt);
     return IsReplayableScalarBind(stmt, reads, write_buffers);
   }
@@ -202,7 +202,7 @@ private:
     Var condition_snapshot("if_condition", condition.dtype(), span);
     Stmt condition_bind = Bind(condition_snapshot, condition, span);
     auto [condition_reads, _] = CollectStmtAccessRegions(condition_bind);
-    const BufferSet write_buffers = CollectWriteBuffers(stmts);
+    const BufferDataSet write_buffers = CollectWriteBuffers(stmts);
     // Replay a read-only condition when no guarded body can change its inputs.
     // Otherwise preserve the original if's single condition evaluation.
     if (!IsReplayableScalarBind(condition_bind, condition_reads,
@@ -252,7 +252,7 @@ private:
       return GuardStmt(condition, body, span);
     }
 
-    const BufferSet write_buffers = CollectWriteBuffers(seq_stmt->seq);
+    const BufferDataSet write_buffers = CollectWriteBuffers(seq_stmt->seq);
     Map<Var, PrimExpr> replayable_binds;
     Array<Stmt> guarded_bodies;
     Array<Stmt> bind_scope;
